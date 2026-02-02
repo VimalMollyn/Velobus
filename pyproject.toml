@@ -1,0 +1,9 @@
+[project]
+name = "pittsburgh-walking-directions"
+version = "0.1.0"
+description = "Pittsburgh walking directions app with Leaflet maps"
+requires-python = ">=3.12"
+dependencies = [
+    "python-fasthtml",
+    "httpx",
+]
