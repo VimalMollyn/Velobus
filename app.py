@@ -20,7 +20,18 @@ app, rt = fast_app(
                 background: white; border-radius: 8px; padding: 16px;
                 width: 300px; box-shadow: 0 2px 6px rgba(0,0,0,0.3);
             }
-            #panel h3 { margin-bottom: 12px; font-size: 16px; }
+            #mode-selector {
+                display: flex; justify-content: center; gap: 8px;
+                margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid #eee;
+            }
+            .mode-btn {
+                background: none; border: 2px solid transparent; border-radius: 8px;
+                padding: 8px 16px; cursor: pointer; display: flex; align-items: center;
+                gap: 4px; font-size: 12px; color: #666; transition: all 0.2s;
+            }
+            .mode-btn:hover { background: #f0f0f0; }
+            .mode-btn.active { border-color: #4285f4; color: #4285f4; background: #e8f0fe; }
+            .mode-btn svg { width: 20px; height: 20px; }
             #panel label { font-size: 13px; color: #555; display: block; margin-bottom: 2px; }
             #panel input[type=text] {
                 width: 100%; padding: 8px 10px; border: 1px solid #ddd;
@@ -28,11 +39,17 @@ app, rt = fast_app(
                 box-sizing: border-box;
             }
             #panel input[type=text]:focus { outline: none; border-color: #4285f4; }
-            .loc-btn {
-                background: none; border: none; color: #4285f4; font-size: 12px;
-                cursor: pointer; padding: 0; margin-bottom: 10px; display: inline-block;
+            .input-wrap {
+                position: relative; margin-bottom: 4px;
             }
-            .loc-btn:hover { text-decoration: underline; }
+            .input-wrap input[type=text] { padding-right: 32px; margin-bottom: 0; }
+            .loc-btn {
+                position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
+                background: none; border: none; cursor: pointer; padding: 4px;
+                color: #666; display: flex; align-items: center; justify-content: center;
+            }
+            .loc-btn:hover { color: #4285f4; }
+            .loc-btn svg { width: 18px; height: 18px; }
             #get-dir {
                 width: 100%; padding: 10px; background: #4285f4; color: white;
                 border: none; border-radius: 4px; font-size: 14px; cursor: pointer;
@@ -43,6 +60,22 @@ app, rt = fast_app(
                 margin-top: 12px; padding-top: 12px; border-top: 1px solid #eee;
                 font-size: 14px; color: #333; display: none;
             }
+            #steps-list {
+                margin-top: 10px; padding: 0; list-style: none; font-size: 13px;
+                max-height: 300px; overflow-y: auto;
+            }
+            #steps-list li {
+                padding: 8px 0; border-bottom: 1px solid #f0f0f0;
+                display: flex; align-items: flex-start; gap: 8px;
+            }
+            #steps-list li:last-child { border-bottom: none; }
+            .step-icon {
+                flex-shrink: 0; width: 20px; height: 20px; background: #e8f0fe;
+                border-radius: 50%; display: flex; align-items: center; justify-content: center;
+                font-size: 10px; color: #4285f4; font-weight: bold; margin-top: 1px;
+            }
+            .step-text { flex: 1; line-height: 1.4; }
+            .step-dist { color: #888; font-size: 12px; }
             .pac-container { z-index: 1002 !important; }
             .pac-container::after { display: none !important; }
         """),
@@ -54,12 +87,35 @@ http_client = httpx.AsyncClient(timeout=10.0)
 
 @rt("/")
 def get():
-    return Title("Pittsburgh Walking Directions"), Div(
+    return Title("Pittsburgh Directions"), Div(
         Div(
-            H3("Walking Directions"),
+            Div(
+                Button(
+                    NotStr('<svg viewBox="0 0 24 24" fill="currentColor"><path d="M13.5 5.5c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zM9.8 8.9L7 23h2.1l1.8-8 2.1 2v6h2v-7.5l-2.1-2 .6-3C14.8 12 16.8 13 19 13v-2c-1.9 0-3.5-1-4.3-2.4l-1-1.6c-.4-.6-1-1-1.7-1-.3 0-.5.1-.8.1L6 8.3V13h2V9.6l1.8-.7"/></svg>'),
+                    "Walk",
+                    cls="mode-btn active", id="mode-walk", data_mode="foot",
+                ),
+                Button(
+                    NotStr('<svg viewBox="0 0 24 24" fill="currentColor"><path d="M15.5 5.5c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zM5 12c-2.8 0-5 2.2-5 5s2.2 5 5 5 5-2.2 5-5-2.2-5-5-5zm0 8.5c-1.9 0-3.5-1.6-3.5-3.5s1.6-3.5 3.5-3.5 3.5 1.6 3.5 3.5-1.6 3.5-3.5 3.5zm5.8-10l2.4-2.4.8.8c1.3 1.3 3 2.1 5 2.1V9c-1.5 0-2.7-.6-3.6-1.5l-1.9-1.9c-.5-.4-1-.6-1.6-.6s-1.1.2-1.4.6L7.8 8.4c-.4.4-.6.9-.6 1.4 0 .6.2 1.1.6 1.4L11 14v5h2v-6.2l-2.2-2.3zM19 12c-2.8 0-5 2.2-5 5s2.2 5 5 5 5-2.2 5-5-2.2-5-5-5zm0 8.5c-1.9 0-3.5-1.6-3.5-3.5s1.6-3.5 3.5-3.5 3.5 1.6 3.5 3.5-1.6 3.5-3.5 3.5z"/></svg>'),
+                    "Bike",
+                    cls="mode-btn", id="mode-bike", data_mode="bike",
+                ),
+                Button(
+                    NotStr('<svg viewBox="0 0 24 24" fill="currentColor"><path d="M4 16c0 .88.39 1.67 1 2.22V20c0 .55.45 1 1 1h1c.55 0 1-.45 1-1v-1h8v1c0 .55.45 1 1 1h1c.55 0 1-.45 1-1v-1.78c.61-.55 1-1.34 1-2.22V6c0-3.5-3.58-4-8-4s-8 .5-8 4v10zm3.5 1c-.83 0-1.5-.67-1.5-1.5S6.67 14 7.5 14s1.5.67 1.5 1.5S8.33 17 7.5 17zm9 0c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zm1.5-6H6V6h12v5z"/></svg>'),
+                    "Transit",
+                    cls="mode-btn", id="mode-transit", data_mode="transit",
+                ),
+                id="mode-selector",
+            ),
             Label("From", _for="from-input"),
-            Input(type="text", id="from-input", placeholder="Starting point"),
-            Button("Use my location", cls="loc-btn", id="use-loc"),
+            Div(
+                Input(type="text", id="from-input", placeholder="Starting point"),
+                Button(
+                    NotStr('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg>'),
+                    cls="loc-btn", id="use-loc", title="Use my location",
+                ),
+                cls="input-wrap",
+            ),
             Label("To", _for="to-input"),
             Input(type="text", id="to-input", placeholder="Destination"),
             Button("Get Directions", id="get-dir"),
@@ -70,11 +126,15 @@ def get():
     ), Script(_map_script())
 
 
+OSRM_PROFILES = {"foot": "foot", "bike": "bike", "transit": "driving"}
+
+
 @rt("/route")
-async def get(start_lat: float, start_lng: float, end_lat: float, end_lng: float):
+async def get(start_lat: float, start_lng: float, end_lat: float, end_lng: float, mode: str = "foot"):
+    profile = OSRM_PROFILES.get(mode, "foot")
     coords = f"{start_lng},{start_lat};{end_lng},{end_lat}"
     resp = await http_client.get(
-        f"https://router.project-osrm.org/route/v1/foot/{coords}",
+        f"https://router.project-osrm.org/route/v1/{profile}/{coords}",
         params={
             "overview": "full",
             "geometries": "geojson",
@@ -120,12 +180,27 @@ document.addEventListener('DOMContentLoaded', function() {
     let endMarker = null;
     let startCoords = null;
     let endCoords = null;
+    let currentMode = 'foot';
 
     const fromInput = document.getElementById('from-input');
     const toInput = document.getElementById('to-input');
     const getDirBtn = document.getElementById('get-dir');
     const useLocBtn = document.getElementById('use-loc');
     const routeInfo = document.getElementById('route-info');
+
+    // Mode selector
+    const modeBtns = document.querySelectorAll('.mode-btn');
+    modeBtns.forEach(btn => {
+        btn.addEventListener('click', () => {
+            modeBtns.forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            currentMode = btn.dataset.mode;
+            // Re-fetch route if we already have coords
+            if (startCoords && endCoords) {
+                getDirBtn.click();
+            }
+        });
+    });
 
     // Pittsburgh bounds for biasing
     const pittsBounds = new google.maps.LatLngBounds(
@@ -163,16 +238,16 @@ document.addEventListener('DOMContentLoaded', function() {
             alert('Geolocation not supported by your browser');
             return;
         }
-        useLocBtn.textContent = 'Locating...';
+        useLocBtn.style.opacity = '0.4';
         navigator.geolocation.getCurrentPosition(
             (pos) => {
                 startCoords = { lat: pos.coords.latitude, lng: pos.coords.longitude };
                 fromInput.value = startCoords.lat.toFixed(5) + ', ' + startCoords.lng.toFixed(5);
-                useLocBtn.textContent = 'Use my location';
+                useLocBtn.style.opacity = '1';
             },
             (err) => {
                 alert('Could not get location: ' + err.message);
-                useLocBtn.textContent = 'Use my location';
+                useLocBtn.style.opacity = '1';
             },
             { enableHighAccuracy: true }
         );
@@ -190,7 +265,8 @@ document.addEventListener('DOMContentLoaded', function() {
 
         try {
             const url = '/route?start_lat=' + startCoords.lat + '&start_lng=' + startCoords.lng
-                      + '&end_lat=' + endCoords.lat + '&end_lng=' + endCoords.lng;
+                      + '&end_lat=' + endCoords.lat + '&end_lng=' + endCoords.lng
+                      + '&mode=' + currentMode;
             const resp = await fetch(url);
             const data = await resp.json();
 
@@ -221,15 +297,19 @@ document.addEventListener('DOMContentLoaded', function() {
                 routeSourceAdded = true;
             }
 
-            // Markers
+            // Markers with labels
+            const startLabel = fromInput.value || 'Start';
+            const endLabel = toInput.value || 'Destination';
             startMarker = new maplibregl.Marker({ color: '#34a853' })
                 .setLngLat([startCoords.lng, startCoords.lat])
-                .setPopup(new maplibregl.Popup().setText('Start'))
+                .setPopup(new maplibregl.Popup({ offset: 25 }).setText(startLabel))
                 .addTo(map);
+            startMarker.togglePopup();
             endMarker = new maplibregl.Marker({ color: '#ea4335' })
                 .setLngLat([endCoords.lng, endCoords.lat])
-                .setPopup(new maplibregl.Popup().setText('Destination'))
+                .setPopup(new maplibregl.Popup({ offset: 25 }).setText(endLabel))
                 .addTo(map);
+            endMarker.togglePopup();
 
             // Fit bounds to route
             const coords = geojson.coordinates;
@@ -240,7 +320,25 @@ document.addEventListener('DOMContentLoaded', function() {
             const distMiles = (route.distance / 1609.34).toFixed(1);
             const mins = Math.round(route.duration / 60);
             routeInfo.style.display = 'block';
-            routeInfo.innerHTML = '<strong>' + distMiles + ' mi</strong> &middot; <strong>' + mins + ' min</strong> walking';
+            const modeLabels = { foot: 'walking', bike: 'biking', transit: 'by transit' };
+            routeInfo.innerHTML = '<strong>' + distMiles + ' mi</strong> &middot; <strong>' + mins + ' min</strong> ' + (modeLabels[currentMode] || 'walking');
+
+            // Show turn-by-turn steps
+            const steps = route.legs[0].steps;
+            let stepsHtml = '<ul id="steps-list">';
+            steps.forEach((step, i) => {
+                const stepDist = step.distance >= 1000
+                    ? (step.distance / 1609.34).toFixed(1) + ' mi'
+                    : Math.round(step.distance * 3.281) + ' ft';
+                const instruction = step.maneuver.instruction || step.name || 'Continue';
+                stepsHtml += '<li>'
+                    + '<div class="step-icon">' + (i + 1) + '</div>'
+                    + '<div class="step-text">' + instruction
+                    + ' <span class="step-dist">(' + stepDist + ')</span></div>'
+                    + '</li>';
+            });
+            stepsHtml += '</ul>';
+            routeInfo.innerHTML += stepsHtml;
 
         } catch (err) {
             alert('Error getting route: ' + err.message);
