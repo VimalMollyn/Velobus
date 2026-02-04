@@ -1,4 +1,8 @@
 # TODO
+- now the problem is that for transit options, the directions are walking + transit. 
+    - this needs to be displayed better on the directions. Also on the map. 
+    - on the map, walking should use a dotted line, and bus should use a solid line. cycling can use a light green line.
+    - let's show the directiosn like a vertical timeline. show estimated timestamps in HH:MM on the left. in the directions, show the public transit number clearly on the left (maybe in a nice symbol).
 
 # DONE
 ### update 4

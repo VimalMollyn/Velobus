@@ -77,6 +77,31 @@ app, rt = fast_app(
             }
             .step-text { flex: 1; line-height: 1.4; }
             .step-dist { color: #888; font-size: 12px; }
+
+            /* Transit timeline */
+            .timeline { margin-top: 10px; padding: 4px 0 0 0; list-style: none; max-height: 350px; overflow-y: auto; }
+            .tl-step { display: flex; gap: 10px; position: relative; padding-bottom: 0; }
+            .tl-time {
+                flex-shrink: 0; width: 42px; font-size: 11px; color: #888;
+                text-align: right; padding-top: 2px; font-weight: 500;
+            }
+            .tl-track { display: flex; flex-direction: column; align-items: center; flex-shrink: 0; width: 20px; }
+            .tl-dot {
+                width: 10px; height: 10px; border-radius: 50%; background: #9aa0a6;
+                border: 2px solid white; box-shadow: 0 0 0 1px #9aa0a6; flex-shrink: 0; z-index: 1;
+            }
+            .tl-dot.transit { background: #4285f4; box-shadow: 0 0 0 1px #4285f4; }
+            .tl-line { width: 3px; flex: 1; background: #dadce0; min-height: 20px; }
+            .tl-line.walk { background: repeating-linear-gradient(to bottom, #9aa0a6 0, #9aa0a6 4px, transparent 4px, transparent 8px); width: 3px; }
+            .tl-line.transit-line { background: #4285f4; }
+            .tl-content { flex: 1; padding-bottom: 14px; font-size: 13px; line-height: 1.4; }
+            .tl-content .tl-label { color: #333; }
+            .tl-content .tl-sub { color: #888; font-size: 12px; margin-top: 2px; }
+            .transit-badge {
+                display: inline-flex; align-items: center; gap: 4px;
+                padding: 2px 8px; border-radius: 4px; font-size: 12px;
+                font-weight: 700; margin-right: 6px; vertical-align: middle;
+            }
             .pac-container { z-index: 1002 !important; }
             .pac-container::after { display: none !important; }
         """),
@@ -177,7 +202,7 @@ async def _google_transit_route(start_lat, start_lng, end_lat, end_lng):
         headers={
             "Content-Type": "application/json",
             "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
-            "X-Goog-FieldMask": "routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline,routes.legs.steps.navigationInstruction,routes.legs.steps.distanceMeters,routes.legs.steps.transitDetails",
+            "X-Goog-FieldMask": "routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline,routes.legs.steps.navigationInstruction,routes.legs.steps.distanceMeters,routes.legs.steps.staticDuration,routes.legs.steps.transitDetails,routes.legs.steps.travelMode,routes.legs.steps.polyline.encodedPolyline",
         },
         json={
             "origin": {"location": {"latLng": {"latitude": start_lat, "longitude": start_lng}}},
@@ -199,25 +224,45 @@ async def _google_transit_route(start_lat, start_lng, end_lat, end_lng):
     # Parse duration (e.g. "1033s" -> 1033)
     duration = int(groute["duration"].rstrip("s"))
 
-    # Convert steps to OSRM-like format
+    # Convert steps — group consecutive WALK steps, keep TRANSIT steps separate
     steps = []
     for step in leg["steps"]:
         instruction = step.get("navigationInstruction", {}).get("instructions", "Continue")
+        travel_mode = step.get("travelMode", "WALK")
+        step_duration = int(step.get("staticDuration", "0s").rstrip("s"))
 
-        transit_detail = ""
+        # Per-step polyline
+        step_polyline = None
+        sp = step.get("polyline", {}).get("encodedPolyline")
+        if sp:
+            step_polyline = {"type": "LineString", "coordinates": _decode_polyline(sp)}
+
         td = step.get("transitDetails")
+        transit_info = None
         if td:
             line = td.get("transitLine", {})
-            name = line.get("nameShort") or line.get("name", "")
-            vehicle = line.get("vehicle", {}).get("name", {}).get("text", "")
-            if name:
-                transit_detail = f" ({vehicle} {name})" if vehicle else f" ({name})"
+            stop_details = td.get("stopDetails", {})
+            transit_info = {
+                "line_short": line.get("nameShort") or line.get("name", ""),
+                "line_name": line.get("name", ""),
+                "vehicle": line.get("vehicle", {}).get("name", {}).get("text", ""),
+                "color": line.get("color", "#4285f4"),
+                "text_color": line.get("textColor", "#ffffff"),
+                "departure_stop": stop_details.get("departureStop", {}).get("name", ""),
+                "arrival_stop": stop_details.get("arrivalStop", {}).get("name", ""),
+                "departure_time": stop_details.get("departureTime", ""),
+                "arrival_time": stop_details.get("arrivalTime", ""),
+                "stop_count": td.get("stopCount", 0),
+                "headsign": td.get("headsign", ""),
+            }
 
         steps.append({
             "distance": step.get("distanceMeters", 0),
-            "duration": 0,
-            "name": "",
-            "maneuver": {"instruction": instruction + transit_detail},
+            "duration": step_duration,
+            "travel_mode": travel_mode,
+            "maneuver": {"instruction": instruction},
+            "polyline": step_polyline,
+            "transit": transit_info,
         })
 
     result = {
@@ -262,7 +307,8 @@ document.addEventListener('DOMContentLoaded', function() {
 
     map.addControl(new maplibregl.NavigationControl());
 
-    let routeSourceAdded = false;
+    let routeLayerIds = [];
+    let routeSourceIds = [];
     let startMarker = null;
     let endMarker = null;
     let startCoords = null;
@@ -364,24 +410,50 @@ document.addEventListener('DOMContentLoaded', function() {
 
             const route = data.routes[0];
             const geojson = route.geometry;
+            const steps = route.legs[0].steps;
 
-            // Remove old markers
+            // Remove old markers & layers
             if (startMarker) startMarker.remove();
             if (endMarker) endMarker.remove();
+            routeLayerIds.forEach(id => { if (map.getLayer(id)) map.removeLayer(id); });
+            routeSourceIds.forEach(id => { if (map.getSource(id)) map.removeSource(id); });
+            routeLayerIds = [];
+            routeSourceIds = [];
 
-            // Add/update route source and layer
-            if (routeSourceAdded) {
-                map.getSource('route').setData(geojson);
-            } else {
-                map.addSource('route', { type: 'geojson', data: geojson });
-                map.addLayer({
-                    id: 'route',
-                    type: 'line',
-                    source: 'route',
-                    layout: { 'line-join': 'round', 'line-cap': 'round' },
-                    paint: { 'line-color': '#4285f4', 'line-width': 5, 'line-opacity': 0.8 },
+            // --- Draw route segments ---
+            if (currentMode === 'transit') {
+                // Per-step segments with different styles
+                steps.forEach((step, i) => {
+                    if (!step.polyline) return;
+                    const srcId = 'route-seg-' + i;
+                    const layerId = 'route-seg-layer-' + i;
+                    map.addSource(srcId, { type: 'geojson', data: step.polyline });
+                    const isTransit = step.travel_mode === 'TRANSIT';
+                    const color = isTransit ? (step.transit && step.transit.color !== '#ffffff' ? step.transit.color : '#4285f4') : '#9aa0a6';
+                    const paint = isTransit
+                        ? { 'line-color': color, 'line-width': 5, 'line-opacity': 0.9 }
+                        : { 'line-color': '#9aa0a6', 'line-width': 4, 'line-opacity': 0.7, 'line-dasharray': [2, 2] };
+                    map.addLayer({
+                        id: layerId, type: 'line', source: srcId,
+                        layout: { 'line-join': 'round', 'line-cap': 'round' },
+                        paint: paint,
+                    });
+                    routeSourceIds.push(srcId);
+                    routeLayerIds.push(layerId);
                 });
-                routeSourceAdded = true;
+            } else {
+                // Single line for walking/biking
+                const srcId = 'route-main';
+                const layerId = 'route-main-layer';
+                map.addSource(srcId, { type: 'geojson', data: geojson });
+                const color = currentMode === 'bike' ? '#0d904f' : '#4285f4';
+                map.addLayer({
+                    id: layerId, type: 'line', source: srcId,
+                    layout: { 'line-join': 'round', 'line-cap': 'round' },
+                    paint: { 'line-color': color, 'line-width': 5, 'line-opacity': 0.8 },
+                });
+                routeSourceIds.push(srcId);
+                routeLayerIds.push(layerId);
             }
 
             // Markers with labels
@@ -410,22 +482,90 @@ document.addEventListener('DOMContentLoaded', function() {
             const modeLabels = { foot: 'walking', bike: 'biking', transit: 'by transit' };
             routeInfo.innerHTML = '<strong>' + distMiles + ' mi</strong> &middot; <strong>' + mins + ' min</strong> ' + (modeLabels[currentMode] || 'walking');
 
-            // Show turn-by-turn steps
-            const steps = route.legs[0].steps;
-            let stepsHtml = '<ul id="steps-list">';
-            steps.forEach((step, i) => {
-                const stepDist = step.distance >= 1000
-                    ? (step.distance / 1609.34).toFixed(1) + ' mi'
-                    : Math.round(step.distance * 3.281) + ' ft';
-                const instruction = step.maneuver.instruction || step.name || 'Continue';
-                stepsHtml += '<li>'
-                    + '<div class="step-icon">' + (i + 1) + '</div>'
-                    + '<div class="step-text">' + instruction
-                    + ' <span class="step-dist">(' + stepDist + ')</span></div>'
-                    + '</li>';
-            });
-            stepsHtml += '</ul>';
-            routeInfo.innerHTML += stepsHtml;
+            // --- Render steps ---
+            if (currentMode === 'transit') {
+                // Timeline view
+                let html = '<ul class="timeline">';
+                steps.forEach((step, i) => {
+                    const isTransit = step.travel_mode === 'TRANSIT';
+                    const t = step.transit;
+
+                    // Time label
+                    let timeStr = '';
+                    if (isTransit && t && t.departure_time) {
+                        const d = new Date(t.departure_time);
+                        timeStr = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true });
+                    }
+
+                    // Dot & line style
+                    const dotCls = isTransit ? 'tl-dot transit' : 'tl-dot';
+                    const lineCls = isTransit ? 'tl-line transit-line' : 'tl-line walk';
+
+                    // Content
+                    let content = '';
+                    if (isTransit && t) {
+                        const badgeColor = (t.color && t.color !== '#ffffff') ? t.color : '#4285f4';
+                        const textColor = (t.text_color && t.text_color !== '#000000') ? t.text_color : '#fff';
+                        content = '<span class="transit-badge" style="background:' + badgeColor + ';color:' + textColor + '">'
+                            + t.line_short + '</span>'
+                            + '<span class="tl-label">' + t.headsign + '</span>'
+                            + '<div class="tl-sub">' + t.departure_stop + ' → ' + t.arrival_stop
+                            + ' &middot; ' + t.stop_count + ' stops</div>';
+                    } else {
+                        const stepDist = step.distance >= 1000
+                            ? (step.distance / 1609.34).toFixed(1) + ' mi'
+                            : Math.round(step.distance * 3.281) + ' ft';
+                        const walkMins = Math.round(step.duration / 60);
+                        content = '<span class="tl-label">Walk ' + stepDist + '</span>'
+                            + '<div class="tl-sub">' + step.maneuver.instruction + ' &middot; ' + walkMins + ' min</div>';
+                    }
+
+                    // Check what comes after this step
+                    const next = steps[i + 1];
+                    const isLast = !next && !(isTransit && t && t.arrival_time);
+
+                    html += '<div class="tl-step">'
+                        + '<div class="tl-time">' + timeStr + '</div>'
+                        + '<div class="tl-track"><div class="' + dotCls + '"></div>'
+                        + (isLast ? '' : '<div class="' + lineCls + '"></div>')
+                        + '</div>'
+                        + '<div class="tl-content">' + content + '</div>'
+                        + '</div>';
+
+                    // Arrival time for transit step
+                    if (isTransit && t && t.arrival_time) {
+                        const arrD = new Date(t.arrival_time);
+                        const arrStr = arrD.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true });
+                        if (!next || next.travel_mode !== 'TRANSIT') {
+                            const hasMore = !!next;
+                            html += '<div class="tl-step">'
+                                + '<div class="tl-time">' + arrStr + '</div>'
+                                + '<div class="tl-track"><div class="tl-dot transit"></div>'
+                                + (hasMore ? '<div class="tl-line walk"></div>' : '') + '</div>'
+                                + '<div class="tl-content"><span class="tl-label">Arrive ' + t.arrival_stop + '</span></div>'
+                                + '</div>';
+                        }
+                    }
+                });
+                html += '</ul>';
+                routeInfo.innerHTML += html;
+            } else {
+                // Simple step list for walk/bike
+                let stepsHtml = '<ul id="steps-list">';
+                steps.forEach((step, i) => {
+                    const stepDist = step.distance >= 1000
+                        ? (step.distance / 1609.34).toFixed(1) + ' mi'
+                        : Math.round(step.distance * 3.281) + ' ft';
+                    const instruction = step.maneuver.instruction || step.name || 'Continue';
+                    stepsHtml += '<li>'
+                        + '<div class="step-icon">' + (i + 1) + '</div>'
+                        + '<div class="step-text">' + instruction
+                        + ' <span class="step-dist">(' + stepDist + ')</span></div>'
+                        + '</li>';
+                });
+                stepsHtml += '</ul>';
+                routeInfo.innerHTML += stepsHtml;
+            }
 
         } catch (err) {
             alert('Error getting route: ' + err.message);
