@@ -182,7 +182,7 @@ def get():
     ), Script(_map_script())
 
 
-OSRM_PROFILES = {"foot": "foot", "bike": "bike"}
+GOOGLE_TRAVEL_MODES = {"foot": "WALK", "bike": "BICYCLE"}
 
 
 def _decode_polyline(encoded):
@@ -208,13 +208,14 @@ def _decode_polyline(encoded):
     return points
 
 
-async def _get_elevation_gain(coords):
-    """Sample points along a coordinate list and return total uphill elevation gain in meters.
+async def _get_elevation_score(coords):
+    """Sample points along a coordinate list and return net elevation impact in meters.
+    Positive = net uphill (penalty), negative = net downhill (advantage).
     coords is a list of [lng, lat] pairs."""
     if len(coords) < 2:
         return 0
-    # Sample up to 15 evenly spaced points to limit API usage
-    max_samples = 15
+    # Sample up to 100 evenly spaced points for accuracy
+    max_samples = 100
     if len(coords) <= max_samples:
         sampled = coords
     else:
@@ -231,24 +232,37 @@ async def _get_elevation_gain(coords):
             return 0
         elevations = [r["elevation"] for r in data["results"]]
         gain = sum(max(0, elevations[i+1] - elevations[i]) for i in range(len(elevations) - 1))
-        return round(gain)
+        loss = sum(max(0, elevations[i] - elevations[i+1]) for i in range(len(elevations) - 1))
+        return round(gain - loss)
     except Exception:
         return 0
 
 
-async def _get_osrm_bike_route(s_lat, s_lng, e_lat, e_lng):
-    """Fetch a bike route from OSRM. Returns (geometry, distance_m, duration_s, elevation_gain_m) or None."""
+async def _get_bike_route(s_lat, s_lng, e_lat, e_lng):
+    """Fetch a bike route via Google Routes API. Returns (geometry, distance_m, duration_s, elevation_score_m) or None."""
     try:
-        resp = await http_client.get(
-            f"https://router.project-osrm.org/route/v1/bike/{s_lng},{s_lat};{e_lng},{e_lat}",
-            params={"overview": "full", "geometries": "geojson", "steps": "false"},
+        resp = await http_client.post(
+            "https://routes.googleapis.com/directions/v2:computeRoutes",
+            headers={
+                "Content-Type": "application/json",
+                "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+                "X-Goog-FieldMask": "routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline",
+            },
+            json={
+                "origin": {"location": {"latLng": {"latitude": s_lat, "longitude": s_lng}}},
+                "destination": {"location": {"latLng": {"latitude": e_lat, "longitude": e_lng}}},
+                "travelMode": "BICYCLE",
+            },
         )
         data = resp.json()
         if data.get("routes"):
             r = data["routes"][0]
-            geom = r["geometry"]
-            elev_gain = await _get_elevation_gain(geom["coordinates"])
-            return geom, r["distance"], round(r["duration"]), elev_gain
+            coords = _decode_polyline(r["polyline"]["encodedPolyline"])
+            geom = {"type": "LineString", "coordinates": coords}
+            dist = r.get("distanceMeters", 0)
+            dur = int(r["duration"].rstrip("s"))
+            elev_gain = await _get_elevation_score(coords)
+            return geom, dist, dur, elev_gain
     except Exception:
         pass
     return None
@@ -256,22 +270,37 @@ async def _get_osrm_bike_route(s_lat, s_lng, e_lat, e_lng):
 
 @rt("/route")
 async def get(start_lat: float, start_lng: float, end_lat: float, end_lng: float, mode: str = "foot"):
-    if mode == "transit":
-        return await _google_transit_route(start_lat, start_lng, end_lat, end_lng)
-    if mode == "bike_transit":
-        return await _bike_transit_route(start_lat, start_lng, end_lat, end_lng)
+    try:
+        if mode == "transit":
+            return await _google_transit_route(start_lat, start_lng, end_lat, end_lng)
+        if mode == "bike_transit":
+            return await _bike_transit_route(start_lat, start_lng, end_lat, end_lng)
 
-    profile = OSRM_PROFILES.get(mode, "foot")
-    coords = f"{start_lng},{start_lat};{end_lng},{end_lat}"
-    resp = await http_client.get(
-        f"https://router.project-osrm.org/route/v1/{profile}/{coords}",
-        params={
-            "overview": "full",
-            "geometries": "geojson",
-            "steps": "true",
-        },
-    )
-    return Response(resp.text, media_type="application/json")
+        travel_mode = GOOGLE_TRAVEL_MODES.get(mode, "WALK")
+        resp = await http_client.post(
+            "https://routes.googleapis.com/directions/v2:computeRoutes",
+            headers={
+                "Content-Type": "application/json",
+                "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+                "X-Goog-FieldMask": "routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline,routes.legs.steps.navigationInstruction,routes.legs.steps.distanceMeters,routes.legs.steps.staticDuration,routes.legs.steps.polyline.encodedPolyline",
+            },
+            json={
+                "origin": {"location": {"latLng": {"latitude": start_lat, "longitude": start_lng}}},
+                "destination": {"location": {"latLng": {"latitude": end_lat, "longitude": end_lng}}},
+                "travelMode": travel_mode,
+            },
+        )
+        data = resp.json()
+        if not data.get("routes"):
+            return Response(json.dumps({"routes": [], "error": "No route found"}), media_type="application/json")
+        result = {"routes": [_parse_transit_route(data["routes"][0])]}
+        return Response(json.dumps(result), media_type="application/json")
+    except Exception as e:
+        print(f"Route error: {e}")
+        return Response(
+            json.dumps({"routes": [], "error": str(e)}),
+            media_type="application/json",
+        )
 
 
 def _parse_transit_route(groute):
@@ -369,11 +398,11 @@ def _score_route(route):
     total_duration = route["duration"]
     num_transfers = sum(1 for s in steps if s["travel_mode"] == "TRANSIT")
     bike_distance = sum(s["distance"] for s in steps if s["travel_mode"] == "BIKE")
-    elev_gain = sum(s.get("elevation_gain", 0) for s in steps if s["travel_mode"] == "BIKE")
+    elev_gain = sum(s.get("elevation_score", 0) for s in steps if s["travel_mode"] == "BIKE")
     return (total_duration
             + (num_transfers * 600)
-            + max(0, bike_distance - 4828) * 0.5
-            + elev_gain * 3)
+            + max(0, bike_distance - 3218) * 0.5
+            + elev_gain * 5)
 
 
 def _rebuild_overview(route):
@@ -388,8 +417,8 @@ def _rebuild_overview(route):
     route["distance"] = sum(s.get("distance", 0) for s in route["legs"][0]["steps"])
 
 
-def _format_pure_bike(geometry, distance, duration, elevation_gain=0):
-    """Wrap an OSRM bike result into transit-compatible response format."""
+def _format_pure_bike(geometry, distance, duration, elevation_score=0):
+    """Wrap a bike route result into transit-compatible response format."""
     return {
         "distance": distance,
         "duration": duration,
@@ -401,7 +430,7 @@ def _format_pure_bike(geometry, distance, duration, elevation_gain=0):
             "maneuver": {"instruction": "Bike to destination"},
             "polyline": geometry,
             "transit": None,
-            "elevation_gain": elevation_gain,
+            "elevation_score": elevation_score,
         }]}],
     }
 
@@ -419,7 +448,7 @@ async def _apply_walk_to_bike(route):
             if len(coords) >= 2:
                 s_lng, s_lat = coords[0]
                 e_lng, e_lat = coords[-1]
-                tasks.append(_get_osrm_bike_route(s_lat, s_lng, e_lat, e_lng))
+                tasks.append(_get_bike_route(s_lat, s_lng, e_lat, e_lng))
                 walk_indices.append(i)
 
     if tasks:
@@ -431,7 +460,7 @@ async def _apply_walk_to_bike(route):
                 step["polyline"] = geom
                 step["distance"] = dist
                 step["duration"] = dur
-                step["elevation_gain"] = elev
+                step["elevation_score"] = elev
             step["travel_mode"] = "BIKE"
 
     _rebuild_overview(route)
@@ -481,7 +510,7 @@ async def _try_eliminate_short_hops(route):
         next_duration = steps[next_idx]["duration"] if next_idx is not None else 0
         combined_duration = transit_duration + prev_duration + next_duration
 
-        bike_result = await _get_osrm_bike_route(s_lat, s_lng, e_lat, e_lng)
+        bike_result = await _get_bike_route(s_lat, s_lng, e_lat, e_lng)
         if not bike_result:
             i += 1
             continue
@@ -498,7 +527,7 @@ async def _try_eliminate_short_hops(route):
                 "maneuver": {"instruction": "Bike (skipping short transit hop)"},
                 "polyline": bike_geom,
                 "transit": None,
-                "elevation_gain": bike_elev,
+                "elevation_score": bike_elev,
             }
             remove_start = prev_idx if prev_idx is not None else i
             remove_end = (next_idx if next_idx is not None else i) + 1
@@ -515,7 +544,7 @@ async def _try_eliminate_short_hops(route):
 async def _bike_transit_route(start_lat, start_lng, end_lat, end_lng):
     """Smart bike+transit routing with multi-candidate evaluation."""
     # Step 1: Parallel data collection
-    pure_bike_task = _get_osrm_bike_route(start_lat, start_lng, end_lat, end_lng)
+    pure_bike_task = _get_bike_route(start_lat, start_lng, end_lat, end_lng)
     transit_task = _google_transit_route(start_lat, start_lng, end_lat, end_lng, compute_alternatives=True)
 
     pure_bike_result, transit_routes = await asyncio.gather(pure_bike_task, transit_task)
@@ -557,7 +586,7 @@ async def _bike_transit_route(start_lat, start_lng, end_lat, end_lng):
         steps = c["legs"][0]["steps"]
         modes = [s["travel_mode"] for s in steps]
         bike_dist = sum(s["distance"] for s in steps if s["travel_mode"] == "BIKE")
-        elev_gain = sum(s.get("elevation_gain", 0) for s in steps if s["travel_mode"] == "BIKE")
+        elev_gain = sum(s.get("elevation_score", 0) for s in steps if s["travel_mode"] == "BIKE")
         transfers = sum(1 for m in modes if m == "TRANSIT")
         print(f"  Candidate {idx}: score={_score_route(c):.0f}  dur={c['duration']}s  "
               f"bike={bike_dist:.0f}m  elev_gain={elev_gain}m  transfers={transfers}  modes={modes}")
@@ -604,6 +633,7 @@ document.addEventListener('DOMContentLoaded', function() {
     let startCoords = null;
     let endCoords = null;
     let currentMode = 'foot';
+    const routeCache = {};
 
     const fromInput = document.getElementById('from-input');
     const toInput = document.getElementById('to-input');
@@ -612,6 +642,10 @@ document.addEventListener('DOMContentLoaded', function() {
     const swapBtn = document.getElementById('swap-btn');
     const routeInfo = document.getElementById('route-info');
 
+    function cacheKey(s, e, mode) {
+        return s.lat.toFixed(6) + ',' + s.lng.toFixed(6) + ',' + e.lat.toFixed(6) + ',' + e.lng.toFixed(6) + ',' + mode;
+    }
+
     // Mode selector
     const modeBtns = document.querySelectorAll('.mode-btn');
     modeBtns.forEach(btn => {
@@ -619,9 +653,8 @@ document.addEventListener('DOMContentLoaded', function() {
             modeBtns.forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
             currentMode = btn.dataset.mode;
-            // Re-fetch route if we already have coords
             if (startCoords && endCoords) {
-                getDirBtn.click();
+                fetchRoute(false);
             }
         });
     });
@@ -664,7 +697,7 @@ document.addEventListener('DOMContentLoaded', function() {
         const tmpCoords = startCoords;
         startCoords = endCoords;
         endCoords = tmpCoords;
-        if (startCoords && endCoords) getDirBtn.click();
+        if (startCoords && endCoords) fetchRoute(false);
     });
 
     // --- Use my location ---
@@ -688,10 +721,18 @@ document.addEventListener('DOMContentLoaded', function() {
         );
     });
 
-    // --- Get Directions ---
-    getDirBtn.addEventListener('click', async () => {
+    // --- Fetch & display route ---
+    async function fetchRoute(forceRefresh) {
         if (!startCoords || !endCoords) {
             alert('Please select both a starting point and destination from the suggestions.');
+            return;
+        }
+
+        const key = cacheKey(startCoords, endCoords, currentMode);
+
+        // Use cache if available and not forcing refresh
+        if (!forceRefresh && routeCache[key]) {
+            displayRoute(routeCache[key]);
             return;
         }
 
@@ -710,6 +751,18 @@ document.addEventListener('DOMContentLoaded', function() {
                 return;
             }
 
+            routeCache[key] = data;
+            displayRoute(data);
+
+        } catch (err) {
+            alert('Error getting route: ' + err.message);
+        } finally {
+            getDirBtn.textContent = 'Get Directions';
+            getDirBtn.disabled = false;
+        }
+    }
+
+    function displayRoute(data) {
             const route = data.routes[0];
             const geojson = route.geometry;
             const steps = route.legs[0].steps;
@@ -878,14 +931,9 @@ document.addEventListener('DOMContentLoaded', function() {
                 stepsHtml += '</ul>';
                 routeInfo.innerHTML += stepsHtml;
             }
+    }
 
-        } catch (err) {
-            alert('Error getting route: ' + err.message);
-        } finally {
-            getDirBtn.textContent = 'Get Directions';
-            getDirBtn.disabled = false;
-        }
-    });
+    getDirBtn.addEventListener('click', () => fetchRoute(true));
 });
 """
 

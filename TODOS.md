@@ -1,6 +1,10 @@
 # TODO
+instead of only showing the top choice. can you also show the next 4 choices. so that the user can compare themselves.
 
 # DONE
+### update 7
+added route caching
+
 ### update 6
 support bike + public transit options
 
