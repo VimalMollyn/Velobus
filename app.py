@@ -128,7 +128,7 @@ http_client = httpx.AsyncClient(timeout=10.0)
 
 @rt("/")
 def get():
-    return Title("Pittsburgh Directions"), Div(
+    return Title("Velobus"), Div(
         Div(
             Div(
                 Button(
