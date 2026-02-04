@@ -1,4 +1,6 @@
 from fasthtml.common import *
+import asyncio
+import copy
 import httpx
 import json
 import os
@@ -19,16 +21,17 @@ app, rt = fast_app(
             #panel {
                 position: absolute; top: 10px; left: 10px; z-index: 1000;
                 background: white; border-radius: 8px; padding: 16px;
-                width: 300px; box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+                width: 380px; box-shadow: 0 2px 6px rgba(0,0,0,0.3);
             }
             #mode-selector {
-                display: flex; justify-content: center; gap: 8px;
+                display: flex; justify-content: center; gap: 4px;
                 margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid #eee;
+                flex-wrap: wrap;
             }
             .mode-btn {
                 background: none; border: 2px solid transparent; border-radius: 8px;
-                padding: 8px 16px; cursor: pointer; display: flex; align-items: center;
-                gap: 4px; font-size: 12px; color: #666; transition: all 0.2s;
+                padding: 8px 12px; cursor: pointer; display: flex; align-items: center;
+                gap: 4px; font-size: 11px; color: #666; transition: all 0.2s;
             }
             .mode-btn:hover { background: #f0f0f0; }
             .mode-btn.active { border-color: #4285f4; color: #4285f4; background: #e8f0fe; }
@@ -94,6 +97,8 @@ app, rt = fast_app(
             .tl-line { width: 3px; flex: 1; background: #dadce0; min-height: 20px; }
             .tl-line.walk { background: repeating-linear-gradient(to bottom, #9aa0a6 0, #9aa0a6 4px, transparent 4px, transparent 8px); width: 3px; }
             .tl-line.transit-line { background: #4285f4; }
+            .tl-dot.bike { background: #0d904f; box-shadow: 0 0 0 1px #0d904f; }
+            .tl-line.bike-line { background: #0d904f; }
             .tl-content { flex: 1; padding-bottom: 14px; font-size: 13px; line-height: 1.4; }
             .tl-content .tl-label { color: #333; }
             .tl-content .tl-sub { color: #888; font-size: 12px; margin-top: 2px; }
@@ -130,6 +135,11 @@ def get():
                     NotStr('<svg viewBox="0 0 24 24" fill="currentColor"><path d="M4 16c0 .88.39 1.67 1 2.22V20c0 .55.45 1 1 1h1c.55 0 1-.45 1-1v-1h8v1c0 .55.45 1 1 1h1c.55 0 1-.45 1-1v-1.78c.61-.55 1-1.34 1-2.22V6c0-3.5-3.58-4-8-4s-8 .5-8 4v10zm3.5 1c-.83 0-1.5-.67-1.5-1.5S6.67 14 7.5 14s1.5.67 1.5 1.5S8.33 17 7.5 17zm9 0c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zm1.5-6H6V6h12v5z"/></svg>'),
                     "Transit",
                     cls="mode-btn", id="mode-transit", data_mode="transit",
+                ),
+                Button(
+                    NotStr('<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C8.14 2 5 3.57 5 6v10c0 1.1.9 2 2 2h1v1c0 .55.45 1 1 1s1-.45 1-1v-1h4v1c0 .55.45 1 1 1s1-.45 1-1v-1h1c1.1 0 2-.9 2-2V6c0-2.43-3.14-4-7-4zm-3.5 14c-.83 0-1.5-.67-1.5-1.5S7.67 13 8.5 13s1.5.67 1.5 1.5S9.33 16 8.5 16zm7 0c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zm1.5-6H7V6h10v4z"/><circle cx="19.5" cy="3.5" r="3.5" fill="#0d904f"/><path d="M18.5 3.5h2M19.5 2.5v2" stroke="white" stroke-width=".8" fill="none"/></svg>'),
+                    NotStr("Bike+Bus"),
+                    cls="mode-btn", id="mode-bike-transit", data_mode="bike_transit",
                 ),
                 id="mode-selector",
             ),
@@ -178,10 +188,28 @@ def _decode_polyline(encoded):
     return points
 
 
+async def _get_osrm_bike_route(s_lat, s_lng, e_lat, e_lng):
+    """Fetch a bike route from OSRM. Returns (geometry, distance_m, duration_s) or None."""
+    try:
+        resp = await http_client.get(
+            f"https://router.project-osrm.org/route/v1/bike/{s_lng},{s_lat};{e_lng},{e_lat}",
+            params={"overview": "full", "geometries": "geojson", "steps": "false"},
+        )
+        data = resp.json()
+        if data.get("routes"):
+            r = data["routes"][0]
+            return r["geometry"], r["distance"], round(r["duration"])
+    except Exception:
+        pass
+    return None
+
+
 @rt("/route")
 async def get(start_lat: float, start_lng: float, end_lat: float, end_lng: float, mode: str = "foot"):
     if mode == "transit":
         return await _google_transit_route(start_lat, start_lng, end_lat, end_lng)
+    if mode == "bike_transit":
+        return await _bike_transit_route(start_lat, start_lng, end_lat, end_lng)
 
     profile = OSRM_PROFILES.get(mode, "foot")
     coords = f"{start_lng},{start_lat};{end_lng},{end_lat}"
@@ -196,42 +224,19 @@ async def get(start_lat: float, start_lng: float, end_lat: float, end_lng: float
     return Response(resp.text, media_type="application/json")
 
 
-async def _google_transit_route(start_lat, start_lng, end_lat, end_lng):
-    resp = await http_client.post(
-        "https://routes.googleapis.com/directions/v2:computeRoutes",
-        headers={
-            "Content-Type": "application/json",
-            "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
-            "X-Goog-FieldMask": "routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline,routes.legs.steps.navigationInstruction,routes.legs.steps.distanceMeters,routes.legs.steps.staticDuration,routes.legs.steps.transitDetails,routes.legs.steps.travelMode,routes.legs.steps.polyline.encodedPolyline",
-        },
-        json={
-            "origin": {"location": {"latLng": {"latitude": start_lat, "longitude": start_lng}}},
-            "destination": {"location": {"latLng": {"latitude": end_lat, "longitude": end_lng}}},
-            "travelMode": "TRANSIT",
-        },
-    )
-    data = resp.json()
-    if not data.get("routes"):
-        return Response(json.dumps({"routes": [], "error": "No transit routes found"}), media_type="application/json")
-
-    groute = data["routes"][0]
+def _parse_transit_route(groute):
+    """Parse a single Google Routes API route into our internal format."""
     leg = groute["legs"][0]
-
-    # Decode polyline to GeoJSON
     coords = _decode_polyline(groute["polyline"]["encodedPolyline"])
     geometry = {"type": "LineString", "coordinates": coords}
-
-    # Parse duration (e.g. "1033s" -> 1033)
     duration = int(groute["duration"].rstrip("s"))
 
-    # Convert steps — group consecutive WALK steps, keep TRANSIT steps separate
     steps = []
     for step in leg["steps"]:
         instruction = step.get("navigationInstruction", {}).get("instructions", "Continue")
         travel_mode = step.get("travelMode", "WALK")
         step_duration = int(step.get("staticDuration", "0s").rstrip("s"))
 
-        # Per-step polyline
         step_polyline = None
         sp = step.get("polyline", {}).get("encodedPolyline")
         if sp:
@@ -265,15 +270,242 @@ async def _google_transit_route(start_lat, start_lng, end_lat, end_lng):
             "transit": transit_info,
         })
 
-    result = {
-        "routes": [{
-            "distance": groute["distanceMeters"],
-            "duration": duration,
-            "geometry": geometry,
-            "legs": [{"steps": steps}],
-        }],
+    return {
+        "distance": groute.get("distanceMeters", 0),
+        "duration": duration,
+        "geometry": geometry,
+        "legs": [{"steps": steps}],
     }
+
+
+async def _google_transit_route(start_lat, start_lng, end_lat, end_lng, compute_alternatives=False):
+    body = {
+        "origin": {"location": {"latLng": {"latitude": start_lat, "longitude": start_lng}}},
+        "destination": {"location": {"latLng": {"latitude": end_lat, "longitude": end_lng}}},
+        "travelMode": "TRANSIT",
+    }
+    if compute_alternatives:
+        body["computeAlternativeRoutes"] = True
+
+    resp = await http_client.post(
+        "https://routes.googleapis.com/directions/v2:computeRoutes",
+        headers={
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+            "X-Goog-FieldMask": "routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline,routes.legs.steps.navigationInstruction,routes.legs.steps.distanceMeters,routes.legs.steps.staticDuration,routes.legs.steps.transitDetails,routes.legs.steps.travelMode,routes.legs.steps.polyline.encodedPolyline",
+        },
+        json=body,
+    )
+    data = resp.json()
+
+    if compute_alternatives:
+        # Return list of parsed routes for internal use
+        if not data.get("routes"):
+            return []
+        return [_parse_transit_route(gr) for gr in data["routes"]]
+
+    # Single route mode — return HTTP response for direct use
+    if not data.get("routes"):
+        return Response(json.dumps({"routes": [], "error": "No transit routes found"}), media_type="application/json")
+    result = {"routes": [_parse_transit_route(data["routes"][0])]}
     return Response(json.dumps(result), media_type="application/json")
+
+
+def _score_route(route):
+    """Score a candidate route. Lower is better.
+    score = total_duration + (num_transfers * 300) + max(0, bike_distance - 4828) * 0.5
+    """
+    steps = route["legs"][0]["steps"]
+    total_duration = route["duration"]
+    num_transfers = sum(1 for s in steps if s["travel_mode"] == "TRANSIT")
+    bike_distance = sum(s["distance"] for s in steps if s["travel_mode"] == "BIKE")
+    return total_duration + (num_transfers * 600) + max(0, bike_distance - 4828) * 0.5
+
+
+def _rebuild_overview(route):
+    """Rebuild overview geometry and total duration from steps."""
+    all_coords = []
+    for step in route["legs"][0]["steps"]:
+        if step.get("polyline") and step["polyline"].get("coordinates"):
+            all_coords.extend(step["polyline"]["coordinates"])
+    if all_coords:
+        route["geometry"] = {"type": "LineString", "coordinates": all_coords}
+    route["duration"] = sum(s.get("duration", 0) for s in route["legs"][0]["steps"])
+    route["distance"] = sum(s.get("distance", 0) for s in route["legs"][0]["steps"])
+
+
+def _format_pure_bike(geometry, distance, duration):
+    """Wrap an OSRM bike result into transit-compatible response format."""
+    return {
+        "distance": distance,
+        "duration": duration,
+        "geometry": geometry,
+        "legs": [{"steps": [{
+            "distance": distance,
+            "duration": duration,
+            "travel_mode": "BIKE",
+            "maneuver": {"instruction": "Bike to destination"},
+            "polyline": geometry,
+            "transit": None,
+        }]}],
+    }
+
+
+async def _apply_walk_to_bike(route):
+    """Variant A: Replace all WALK steps with OSRM bike routes. Returns a new route dict."""
+    route = copy.deepcopy(route)
+    steps = route["legs"][0]["steps"]
+
+    tasks = []
+    walk_indices = []
+    for i, step in enumerate(steps):
+        if step["travel_mode"] == "WALK" and step.get("polyline"):
+            coords = step["polyline"]["coordinates"]
+            if len(coords) >= 2:
+                s_lng, s_lat = coords[0]
+                e_lng, e_lat = coords[-1]
+                tasks.append(_get_osrm_bike_route(s_lat, s_lng, e_lat, e_lng))
+                walk_indices.append(i)
+
+    if tasks:
+        results = await asyncio.gather(*tasks)
+        for idx, result in zip(walk_indices, results):
+            step = steps[idx]
+            if result:
+                geom, dist, dur = result
+                step["polyline"] = geom
+                step["distance"] = dist
+                step["duration"] = dur
+            step["travel_mode"] = "BIKE"
+
+    _rebuild_overview(route)
+    return route
+
+
+async def _try_eliminate_short_hops(route):
+    """Variant B: For transit segments < 1.5 miles, check if biking through is faster.
+    If transit saves < 3 minutes vs biking, eliminate it. Returns a new route dict."""
+    route = copy.deepcopy(route)
+    steps = route["legs"][0]["steps"]
+
+    SHORT_HOP_THRESHOLD = 2414  # 1.5 miles in meters
+    MIN_TIME_SAVINGS = 180  # 3 minutes
+
+    i = 0
+    while i < len(steps):
+        step = steps[i]
+        if step["travel_mode"] != "TRANSIT" or step["distance"] >= SHORT_HOP_THRESHOLD:
+            i += 1
+            continue
+
+        # Find the bike/walk segments on either side
+        prev_idx = i - 1 if i > 0 and steps[i - 1]["travel_mode"] in ("WALK", "BIKE") else None
+        next_idx = i + 1 if i + 1 < len(steps) and steps[i + 1]["travel_mode"] in ("WALK", "BIKE") else None
+
+        # Get start coord from prev segment start (or transit start) and end coord from next segment end (or transit end)
+        if prev_idx is not None and steps[prev_idx].get("polyline", {}).get("coordinates"):
+            s_lng, s_lat = steps[prev_idx]["polyline"]["coordinates"][0]
+        elif step.get("polyline", {}).get("coordinates"):
+            s_lng, s_lat = step["polyline"]["coordinates"][0]
+        else:
+            i += 1
+            continue
+
+        if next_idx is not None and steps[next_idx].get("polyline", {}).get("coordinates"):
+            e_lng, e_lat = steps[next_idx]["polyline"]["coordinates"][-1]
+        elif step.get("polyline", {}).get("coordinates"):
+            e_lng, e_lat = step["polyline"]["coordinates"][-1]
+        else:
+            i += 1
+            continue
+
+        # Duration of the segments we'd replace
+        transit_duration = step["duration"]
+        prev_duration = steps[prev_idx]["duration"] if prev_idx is not None else 0
+        next_duration = steps[next_idx]["duration"] if next_idx is not None else 0
+        combined_duration = transit_duration + prev_duration + next_duration
+
+        bike_result = await _get_osrm_bike_route(s_lat, s_lng, e_lat, e_lng)
+        if not bike_result:
+            i += 1
+            continue
+
+        bike_geom, bike_dist, bike_dur = bike_result
+
+        # Only eliminate if transit doesn't save enough time
+        if combined_duration - bike_dur < MIN_TIME_SAVINGS:
+            # Replace: remove prev, transit, next and insert single bike segment
+            new_step = {
+                "distance": bike_dist,
+                "duration": bike_dur,
+                "travel_mode": "BIKE",
+                "maneuver": {"instruction": "Bike (skipping short transit hop)"},
+                "polyline": bike_geom,
+                "transit": None,
+            }
+            remove_start = prev_idx if prev_idx is not None else i
+            remove_end = (next_idx if next_idx is not None else i) + 1
+            steps[remove_start:remove_end] = [new_step]
+            # Don't increment i — re-check from same position
+        else:
+            i += 1
+        continue
+
+    _rebuild_overview(route)
+    return route
+
+
+async def _bike_transit_route(start_lat, start_lng, end_lat, end_lng):
+    """Smart bike+transit routing with multi-candidate evaluation."""
+    # Step 1: Parallel data collection
+    pure_bike_task = _get_osrm_bike_route(start_lat, start_lng, end_lat, end_lng)
+    transit_task = _google_transit_route(start_lat, start_lng, end_lat, end_lng, compute_alternatives=True)
+
+    pure_bike_result, transit_routes = await asyncio.gather(pure_bike_task, transit_task)
+
+    candidates = []
+
+    # Step 2: Generate variants for each transit itinerary
+    variant_tasks = []
+    for tr in transit_routes:
+        variant_tasks.append(_apply_walk_to_bike(tr))       # Variant A
+        variant_tasks.append(_try_eliminate_short_hops(tr))  # Variant B (on original with walks)
+
+    if variant_tasks:
+        variants = await asyncio.gather(*variant_tasks)
+        # Variant A and B come in pairs per transit route
+        for i in range(0, len(variants), 2):
+            variant_a = variants[i]
+            candidates.append(variant_a)
+            # Also apply hop elimination on the bike-replaced version
+            variant_b_on_a = await _try_eliminate_short_hops(variant_a)
+            candidates.append(variant_b_on_a)
+
+    # Variant C: Pure bike if < 6 miles (~9656m)
+    if pure_bike_result:
+        geom, dist, dur = pure_bike_result
+        if dist < 9656:
+            candidates.append(_format_pure_bike(geom, dist, dur))
+
+    if not candidates:
+        # Fallback: return pure bike if available, or error
+        if pure_bike_result:
+            geom, dist, dur = pure_bike_result
+            result = {"routes": [_format_pure_bike(geom, dist, dur)]}
+            return Response(json.dumps(result), media_type="application/json")
+        return Response(json.dumps({"routes": [], "error": "No routes found"}), media_type="application/json")
+
+    # Step 3: Score and select best
+    for idx, c in enumerate(candidates):
+        steps = c["legs"][0]["steps"]
+        modes = [s["travel_mode"] for s in steps]
+        bike_dist = sum(s["distance"] for s in steps if s["travel_mode"] == "BIKE")
+        transfers = sum(1 for m in modes if m == "TRANSIT")
+        print(f"  Candidate {idx}: score={_score_route(c):.0f}  dur={c['duration']}s  "
+              f"bike={bike_dist:.0f}m  transfers={transfers}  modes={modes}")
+    best = min(candidates, key=_score_route)
+    print(f"  → Selected candidate with score={_score_route(best):.0f}")
+    return Response(json.dumps({"routes": [best]}), media_type="application/json")
 
 
 def _map_script():
@@ -421,7 +653,8 @@ document.addEventListener('DOMContentLoaded', function() {
             routeSourceIds = [];
 
             // --- Draw route segments ---
-            if (currentMode === 'transit') {
+            const isTransitMode = currentMode === 'transit' || currentMode === 'bike_transit';
+            if (isTransitMode) {
                 // Per-step segments with different styles
                 steps.forEach((step, i) => {
                     if (!step.polyline) return;
@@ -429,10 +662,16 @@ document.addEventListener('DOMContentLoaded', function() {
                     const layerId = 'route-seg-layer-' + i;
                     map.addSource(srcId, { type: 'geojson', data: step.polyline });
                     const isTransit = step.travel_mode === 'TRANSIT';
-                    const color = isTransit ? (step.transit && step.transit.color !== '#ffffff' ? step.transit.color : '#4285f4') : '#9aa0a6';
-                    const paint = isTransit
-                        ? { 'line-color': color, 'line-width': 5, 'line-opacity': 0.9 }
-                        : { 'line-color': '#9aa0a6', 'line-width': 4, 'line-opacity': 0.7, 'line-dasharray': [2, 2] };
+                    const isBike = step.travel_mode === 'BIKE';
+                    let paint;
+                    if (isTransit) {
+                        const color = (step.transit && step.transit.color !== '#ffffff') ? step.transit.color : '#4285f4';
+                        paint = { 'line-color': color, 'line-width': 5, 'line-opacity': 0.9 };
+                    } else if (isBike) {
+                        paint = { 'line-color': '#0d904f', 'line-width': 4, 'line-opacity': 0.8 };
+                    } else {
+                        paint = { 'line-color': '#9aa0a6', 'line-width': 4, 'line-opacity': 0.7, 'line-dasharray': [2, 2] };
+                    }
                     map.addLayer({
                         id: layerId, type: 'line', source: srcId,
                         layout: { 'line-join': 'round', 'line-cap': 'round' },
@@ -463,12 +702,10 @@ document.addEventListener('DOMContentLoaded', function() {
                 .setLngLat([startCoords.lng, startCoords.lat])
                 .setPopup(new maplibregl.Popup({ offset: 25 }).setText(startLabel))
                 .addTo(map);
-            startMarker.togglePopup();
             endMarker = new maplibregl.Marker({ color: '#ea4335' })
                 .setLngLat([endCoords.lng, endCoords.lat])
                 .setPopup(new maplibregl.Popup({ offset: 25 }).setText(endLabel))
                 .addTo(map);
-            endMarker.togglePopup();
 
             // Fit bounds to route
             const coords = geojson.coordinates;
@@ -479,31 +716,34 @@ document.addEventListener('DOMContentLoaded', function() {
             const distMiles = (route.distance / 1609.34).toFixed(1);
             const mins = Math.round(route.duration / 60);
             routeInfo.style.display = 'block';
-            const modeLabels = { foot: 'walking', bike: 'biking', transit: 'by transit' };
+            const modeLabels = { foot: 'walking', bike: 'biking', transit: 'by transit', bike_transit: 'bike + transit' };
             routeInfo.innerHTML = '<strong>' + distMiles + ' mi</strong> &middot; <strong>' + mins + ' min</strong> ' + (modeLabels[currentMode] || 'walking');
 
             // --- Render steps ---
-            if (currentMode === 'transit') {
+            if (isTransitMode) {
                 // Timeline view
                 let html = '<ul class="timeline">';
                 steps.forEach((step, i) => {
-                    const isTransit = step.travel_mode === 'TRANSIT';
+                    const isTransitStep = step.travel_mode === 'TRANSIT';
+                    const isBikeStep = step.travel_mode === 'BIKE';
                     const t = step.transit;
 
                     // Time label
                     let timeStr = '';
-                    if (isTransit && t && t.departure_time) {
+                    if (isTransitStep && t && t.departure_time) {
                         const d = new Date(t.departure_time);
                         timeStr = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true });
                     }
 
                     // Dot & line style
-                    const dotCls = isTransit ? 'tl-dot transit' : 'tl-dot';
-                    const lineCls = isTransit ? 'tl-line transit-line' : 'tl-line walk';
+                    let dotCls = 'tl-dot';
+                    let lineCls = 'tl-line walk';
+                    if (isTransitStep) { dotCls = 'tl-dot transit'; lineCls = 'tl-line transit-line'; }
+                    else if (isBikeStep) { dotCls = 'tl-dot bike'; lineCls = 'tl-line bike-line'; }
 
                     // Content
                     let content = '';
-                    if (isTransit && t) {
+                    if (isTransitStep && t) {
                         const badgeColor = (t.color && t.color !== '#ffffff') ? t.color : '#4285f4';
                         const textColor = (t.text_color && t.text_color !== '#000000') ? t.text_color : '#fff';
                         content = '<span class="transit-badge" style="background:' + badgeColor + ';color:' + textColor + '">'
@@ -515,14 +755,15 @@ document.addEventListener('DOMContentLoaded', function() {
                         const stepDist = step.distance >= 1000
                             ? (step.distance / 1609.34).toFixed(1) + ' mi'
                             : Math.round(step.distance * 3.281) + ' ft';
-                        const walkMins = Math.round(step.duration / 60);
-                        content = '<span class="tl-label">Walk ' + stepDist + '</span>'
-                            + '<div class="tl-sub">' + step.maneuver.instruction + ' &middot; ' + walkMins + ' min</div>';
+                        const moveMins = Math.round(step.duration / 60);
+                        const moveLabel = isBikeStep ? 'Bike' : 'Walk';
+                        content = '<span class="tl-label">' + moveLabel + ' ' + stepDist + '</span>'
+                            + '<div class="tl-sub">' + step.maneuver.instruction + ' &middot; ' + moveMins + ' min</div>';
                     }
 
                     // Check what comes after this step
                     const next = steps[i + 1];
-                    const isLast = !next && !(isTransit && t && t.arrival_time);
+                    const isLast = !next && !(isTransitStep && t && t.arrival_time);
 
                     html += '<div class="tl-step">'
                         + '<div class="tl-time">' + timeStr + '</div>'
@@ -533,15 +774,16 @@ document.addEventListener('DOMContentLoaded', function() {
                         + '</div>';
 
                     // Arrival time for transit step
-                    if (isTransit && t && t.arrival_time) {
+                    if (isTransitStep && t && t.arrival_time) {
                         const arrD = new Date(t.arrival_time);
                         const arrStr = arrD.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true });
                         if (!next || next.travel_mode !== 'TRANSIT') {
                             const hasMore = !!next;
+                            const nextLineCls = (hasMore && next.travel_mode === 'BIKE') ? 'tl-line bike-line' : 'tl-line walk';
                             html += '<div class="tl-step">'
                                 + '<div class="tl-time">' + arrStr + '</div>'
                                 + '<div class="tl-track"><div class="tl-dot transit"></div>'
-                                + (hasMore ? '<div class="tl-line walk"></div>' : '') + '</div>'
+                                + (hasMore ? '<div class="' + nextLineCls + '"></div>' : '') + '</div>'
                                 + '<div class="tl-content"><span class="tl-label">Arrive ' + t.arrival_stop + '</span></div>'
                                 + '</div>';
                         }
