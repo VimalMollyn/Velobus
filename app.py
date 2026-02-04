@@ -107,6 +107,16 @@ app, rt = fast_app(
                 padding: 2px 8px; border-radius: 4px; font-size: 12px;
                 font-weight: 700; margin-right: 6px; vertical-align: middle;
             }
+            .inputs-row { display: flex; align-items: center; gap: 4px; }
+            .inputs-col { flex: 1; min-width: 0; }
+            .swap-btn {
+                flex-shrink: 0; background: none; border: 1px solid #ddd; border-radius: 50%;
+                width: 32px; height: 32px; cursor: pointer; display: flex; align-items: center;
+                justify-content: center; color: #666; padding: 0; margin-top: 10px;
+                transition: all 0.2s;
+            }
+            .swap-btn:hover { background: #f0f0f0; color: #4285f4; border-color: #4285f4; }
+            .swap-btn svg { width: 20px; height: 20px; }
             .pac-container { z-index: 1002 !important; }
             .pac-container::after { display: none !important; }
         """),
@@ -143,17 +153,27 @@ def get():
                 ),
                 id="mode-selector",
             ),
-            Label("From", _for="from-input"),
             Div(
-                Input(type="text", id="from-input", placeholder="Starting point"),
-                Button(
-                    NotStr('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg>'),
-                    cls="loc-btn", id="use-loc", title="Use my location",
+                Div(
+                    Label("From", _for="from-input"),
+                    Div(
+                        Input(type="text", id="from-input", placeholder="Starting point"),
+                        Button(
+                            NotStr('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg>'),
+                            cls="loc-btn", id="use-loc", title="Use my location",
+                        ),
+                        cls="input-wrap",
+                    ),
+                    Label("To", _for="to-input"),
+                    Input(type="text", id="to-input", placeholder="Destination"),
+                    cls="inputs-col",
                 ),
-                cls="input-wrap",
+                Button(
+                    NotStr('<svg viewBox="0 0 24 24" fill="currentColor"><path d="M16 17.01V10h-2v7.01h-3L15 21l4-3.99h-3zM9 3L5 6.99h3V14h2V6.99h3L9 3z"/></svg>'),
+                    cls="swap-btn", id="swap-btn", title="Swap start and destination",
+                ),
+                cls="inputs-row",
             ),
-            Label("To", _for="to-input"),
-            Input(type="text", id="to-input", placeholder="Destination"),
             Button("Get Directions", id="get-dir"),
             Div(id="route-info"),
             id="panel",
@@ -188,8 +208,36 @@ def _decode_polyline(encoded):
     return points
 
 
+async def _get_elevation_gain(coords):
+    """Sample points along a coordinate list and return total uphill elevation gain in meters.
+    coords is a list of [lng, lat] pairs."""
+    if len(coords) < 2:
+        return 0
+    # Sample up to 15 evenly spaced points to limit API usage
+    max_samples = 15
+    if len(coords) <= max_samples:
+        sampled = coords
+    else:
+        step = (len(coords) - 1) / (max_samples - 1)
+        sampled = [coords[round(i * step)] for i in range(max_samples)]
+    locations = "|".join(f"{lat},{lng}" for lng, lat in sampled)
+    try:
+        resp = await http_client.get(
+            "https://maps.googleapis.com/maps/api/elevation/json",
+            params={"locations": locations, "key": GOOGLE_PLACES_API_KEY},
+        )
+        data = resp.json()
+        if data.get("status") != "OK":
+            return 0
+        elevations = [r["elevation"] for r in data["results"]]
+        gain = sum(max(0, elevations[i+1] - elevations[i]) for i in range(len(elevations) - 1))
+        return round(gain)
+    except Exception:
+        return 0
+
+
 async def _get_osrm_bike_route(s_lat, s_lng, e_lat, e_lng):
-    """Fetch a bike route from OSRM. Returns (geometry, distance_m, duration_s) or None."""
+    """Fetch a bike route from OSRM. Returns (geometry, distance_m, duration_s, elevation_gain_m) or None."""
     try:
         resp = await http_client.get(
             f"https://router.project-osrm.org/route/v1/bike/{s_lng},{s_lat};{e_lng},{e_lat}",
@@ -198,7 +246,9 @@ async def _get_osrm_bike_route(s_lat, s_lng, e_lat, e_lng):
         data = resp.json()
         if data.get("routes"):
             r = data["routes"][0]
-            return r["geometry"], r["distance"], round(r["duration"])
+            geom = r["geometry"]
+            elev_gain = await _get_elevation_gain(geom["coordinates"])
+            return geom, r["distance"], round(r["duration"]), elev_gain
     except Exception:
         pass
     return None
@@ -313,13 +363,17 @@ async def _google_transit_route(start_lat, start_lng, end_lat, end_lng, compute_
 
 def _score_route(route):
     """Score a candidate route. Lower is better.
-    score = total_duration + (num_transfers * 300) + max(0, bike_distance - 4828) * 0.5
+    Penalizes transfers, long bike distances, and uphill biking.
     """
     steps = route["legs"][0]["steps"]
     total_duration = route["duration"]
     num_transfers = sum(1 for s in steps if s["travel_mode"] == "TRANSIT")
     bike_distance = sum(s["distance"] for s in steps if s["travel_mode"] == "BIKE")
-    return total_duration + (num_transfers * 600) + max(0, bike_distance - 4828) * 0.5
+    elev_gain = sum(s.get("elevation_gain", 0) for s in steps if s["travel_mode"] == "BIKE")
+    return (total_duration
+            + (num_transfers * 600)
+            + max(0, bike_distance - 4828) * 0.5
+            + elev_gain * 3)
 
 
 def _rebuild_overview(route):
@@ -334,7 +388,7 @@ def _rebuild_overview(route):
     route["distance"] = sum(s.get("distance", 0) for s in route["legs"][0]["steps"])
 
 
-def _format_pure_bike(geometry, distance, duration):
+def _format_pure_bike(geometry, distance, duration, elevation_gain=0):
     """Wrap an OSRM bike result into transit-compatible response format."""
     return {
         "distance": distance,
@@ -347,6 +401,7 @@ def _format_pure_bike(geometry, distance, duration):
             "maneuver": {"instruction": "Bike to destination"},
             "polyline": geometry,
             "transit": None,
+            "elevation_gain": elevation_gain,
         }]}],
     }
 
@@ -372,10 +427,11 @@ async def _apply_walk_to_bike(route):
         for idx, result in zip(walk_indices, results):
             step = steps[idx]
             if result:
-                geom, dist, dur = result
+                geom, dist, dur, elev = result
                 step["polyline"] = geom
                 step["distance"] = dist
                 step["duration"] = dur
+                step["elevation_gain"] = elev
             step["travel_mode"] = "BIKE"
 
     _rebuild_overview(route)
@@ -430,7 +486,7 @@ async def _try_eliminate_short_hops(route):
             i += 1
             continue
 
-        bike_geom, bike_dist, bike_dur = bike_result
+        bike_geom, bike_dist, bike_dur, bike_elev = bike_result
 
         # Only eliminate if transit doesn't save enough time
         if combined_duration - bike_dur < MIN_TIME_SAVINGS:
@@ -442,6 +498,7 @@ async def _try_eliminate_short_hops(route):
                 "maneuver": {"instruction": "Bike (skipping short transit hop)"},
                 "polyline": bike_geom,
                 "transit": None,
+                "elevation_gain": bike_elev,
             }
             remove_start = prev_idx if prev_idx is not None else i
             remove_end = (next_idx if next_idx is not None else i) + 1
@@ -483,15 +540,15 @@ async def _bike_transit_route(start_lat, start_lng, end_lat, end_lng):
 
     # Variant C: Pure bike if < 6 miles (~9656m)
     if pure_bike_result:
-        geom, dist, dur = pure_bike_result
+        geom, dist, dur, elev = pure_bike_result
         if dist < 9656:
-            candidates.append(_format_pure_bike(geom, dist, dur))
+            candidates.append(_format_pure_bike(geom, dist, dur, elev))
 
     if not candidates:
         # Fallback: return pure bike if available, or error
         if pure_bike_result:
-            geom, dist, dur = pure_bike_result
-            result = {"routes": [_format_pure_bike(geom, dist, dur)]}
+            geom, dist, dur, elev = pure_bike_result
+            result = {"routes": [_format_pure_bike(geom, dist, dur, elev)]}
             return Response(json.dumps(result), media_type="application/json")
         return Response(json.dumps({"routes": [], "error": "No routes found"}), media_type="application/json")
 
@@ -500,9 +557,10 @@ async def _bike_transit_route(start_lat, start_lng, end_lat, end_lng):
         steps = c["legs"][0]["steps"]
         modes = [s["travel_mode"] for s in steps]
         bike_dist = sum(s["distance"] for s in steps if s["travel_mode"] == "BIKE")
+        elev_gain = sum(s.get("elevation_gain", 0) for s in steps if s["travel_mode"] == "BIKE")
         transfers = sum(1 for m in modes if m == "TRANSIT")
         print(f"  Candidate {idx}: score={_score_route(c):.0f}  dur={c['duration']}s  "
-              f"bike={bike_dist:.0f}m  transfers={transfers}  modes={modes}")
+              f"bike={bike_dist:.0f}m  elev_gain={elev_gain}m  transfers={transfers}  modes={modes}")
     best = min(candidates, key=_score_route)
     print(f"  → Selected candidate with score={_score_route(best):.0f}")
     return Response(json.dumps({"routes": [best]}), media_type="application/json")
@@ -551,6 +609,7 @@ document.addEventListener('DOMContentLoaded', function() {
     const toInput = document.getElementById('to-input');
     const getDirBtn = document.getElementById('get-dir');
     const useLocBtn = document.getElementById('use-loc');
+    const swapBtn = document.getElementById('swap-btn');
     const routeInfo = document.getElementById('route-info');
 
     // Mode selector
@@ -595,6 +654,17 @@ document.addEventListener('DOMContentLoaded', function() {
         if (place.geometry) {
             endCoords = { lat: place.geometry.location.lat(), lng: place.geometry.location.lng() };
         }
+    });
+
+    // --- Swap from/to ---
+    swapBtn.addEventListener('click', () => {
+        const tmpVal = fromInput.value;
+        fromInput.value = toInput.value;
+        toInput.value = tmpVal;
+        const tmpCoords = startCoords;
+        startCoords = endCoords;
+        endCoords = tmpCoords;
+        if (startCoords && endCoords) getDirBtn.click();
     });
 
     // --- Use my location ---
