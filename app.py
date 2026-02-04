@@ -1,5 +1,6 @@
 from fasthtml.common import *
 import httpx
+import json
 import os
 from dotenv import load_dotenv
 
@@ -126,11 +127,37 @@ def get():
     ), Script(_map_script())
 
 
-OSRM_PROFILES = {"foot": "foot", "bike": "bike", "transit": "driving"}
+OSRM_PROFILES = {"foot": "foot", "bike": "bike"}
+
+
+def _decode_polyline(encoded):
+    """Decode a Google encoded polyline into a list of [lng, lat] coords."""
+    points = []
+    idx, lat, lng = 0, 0, 0
+    while idx < len(encoded):
+        for is_lng in (False, True):
+            shift, result = 0, 0
+            while True:
+                b = ord(encoded[idx]) - 63
+                idx += 1
+                result |= (b & 0x1F) << shift
+                shift += 5
+                if b < 0x20:
+                    break
+            delta = ~(result >> 1) if (result & 1) else (result >> 1)
+            if is_lng:
+                lng += delta
+            else:
+                lat += delta
+        points.append([lng / 1e5, lat / 1e5])
+    return points
 
 
 @rt("/route")
 async def get(start_lat: float, start_lng: float, end_lat: float, end_lng: float, mode: str = "foot"):
+    if mode == "transit":
+        return await _google_transit_route(start_lat, start_lng, end_lat, end_lng)
+
     profile = OSRM_PROFILES.get(mode, "foot")
     coords = f"{start_lng},{start_lat};{end_lng},{end_lat}"
     resp = await http_client.get(
@@ -142,6 +169,66 @@ async def get(start_lat: float, start_lng: float, end_lat: float, end_lng: float
         },
     )
     return Response(resp.text, media_type="application/json")
+
+
+async def _google_transit_route(start_lat, start_lng, end_lat, end_lng):
+    resp = await http_client.post(
+        "https://routes.googleapis.com/directions/v2:computeRoutes",
+        headers={
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+            "X-Goog-FieldMask": "routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline,routes.legs.steps.navigationInstruction,routes.legs.steps.distanceMeters,routes.legs.steps.transitDetails",
+        },
+        json={
+            "origin": {"location": {"latLng": {"latitude": start_lat, "longitude": start_lng}}},
+            "destination": {"location": {"latLng": {"latitude": end_lat, "longitude": end_lng}}},
+            "travelMode": "TRANSIT",
+        },
+    )
+    data = resp.json()
+    if not data.get("routes"):
+        return Response(json.dumps({"routes": [], "error": "No transit routes found"}), media_type="application/json")
+
+    groute = data["routes"][0]
+    leg = groute["legs"][0]
+
+    # Decode polyline to GeoJSON
+    coords = _decode_polyline(groute["polyline"]["encodedPolyline"])
+    geometry = {"type": "LineString", "coordinates": coords}
+
+    # Parse duration (e.g. "1033s" -> 1033)
+    duration = int(groute["duration"].rstrip("s"))
+
+    # Convert steps to OSRM-like format
+    steps = []
+    for step in leg["steps"]:
+        instruction = step.get("navigationInstruction", {}).get("instructions", "Continue")
+
+        transit_detail = ""
+        td = step.get("transitDetails")
+        if td:
+            line = td.get("transitLine", {})
+            name = line.get("nameShort") or line.get("name", "")
+            vehicle = line.get("vehicle", {}).get("name", {}).get("text", "")
+            if name:
+                transit_detail = f" ({vehicle} {name})" if vehicle else f" ({name})"
+
+        steps.append({
+            "distance": step.get("distanceMeters", 0),
+            "duration": 0,
+            "name": "",
+            "maneuver": {"instruction": instruction + transit_detail},
+        })
+
+    result = {
+        "routes": [{
+            "distance": groute["distanceMeters"],
+            "duration": duration,
+            "geometry": geometry,
+            "legs": [{"steps": steps}],
+        }],
+    }
+    return Response(json.dumps(result), media_type="application/json")
 
 
 def _map_script():

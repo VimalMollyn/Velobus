@@ -1,6 +1,9 @@
 # TODO
 
 # DONE
+### update 4
+- updated to google routes api, so that we can get live transit recommendations.
+
 ### update 3
 - Replaced "Use my location" text button with a crosshair icon inside the From input field
 - Added turn-by-turn direction steps below route summary (scrollable list with numbered steps and distances)
